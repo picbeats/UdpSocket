@@ -70,7 +70,6 @@ namespace UdpSockets
             lock (sendQueue)
             {
                 terminated = true;
-                socket?.Close(100);
                 socket?.Dispose();
                 DisposeAsynceEventArgs(ref asyncReadEventArgs);
                 DisposeAsynceEventArgs(ref asyncSendEventArgs);
@@ -173,8 +172,12 @@ namespace UdpSockets
 
                 OnPaketReceived(datagram);
 
-                repeat = !terminated &&
-                         !(socket?.ReceiveFromAsync(e) ?? true);
+                lock (sendQueue)
+                {
+                    repeat = !terminated &&
+                             !(socket?.ReceiveFromAsync(e) ?? true);
+                }
+                
             } while (repeat);
         }
 
