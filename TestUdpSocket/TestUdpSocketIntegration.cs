@@ -1,8 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices.ComTypes;
+using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
 using NUnit.Framework;
 using UdpSockets;
 
@@ -12,50 +16,133 @@ namespace Test.UdpSockets
     internal class TestUdpSocketIntegration
     {
         private static readonly Random Random = new Random();
+        private static readonly IPEndPoint AnyPort = new IPEndPoint(IPAddress.Any, 0);
+        private static readonly byte[] PerformanceTestDatagramData = new byte[100];
+        private CancellationTokenSource cancellationTokenSource;
 
-        private delegate Task EchoTest(IEnumerable<IUdpSocket> client, IPEndPoint serverEndPoint);
+        private delegate Task ClientWithEchoServerTest(IUdpSocket client, IPEndPoint serverEndPoint);
+        private delegate Task ServerTest(IPEndPoint serverEndPoint);
+        private delegate UdpDatagram CreateDatagram(IPEndPoint serverEndPoint);
 
-        private static void RunTest(EchoTest test, int clientCount)
+        [SetUp]
+        public void SetUp()
         {
-            var anyPort = new IPEndPoint(IPAddress.Any, 0);
+            cancellationTokenSource = new CancellationTokenSource(10000);
+        }
 
-            using (var server = new UdpSocket(new IPEndPoint(IPAddress.Any, 65314), anyPort))
+        [Test]
+        public Task TestEcho()
+        {
+            return RunWithServer(WithParallelClients(1, EchoRequests(1, WithRandomDatagram(8))));
+        }
+
+        [Test]
+        public async Task TestEchoMany()
+        {
+            const int clientCount = 20;
+            const int requestCount = 10;
+            var elapsed = await Measure(() => RunWithServer(WithParallelClients(clientCount, EchoRequests(requestCount, WithRandomDatagram(8)))));
+            Console.WriteLine($"Running {clientCount} with {requestCount} requests  in parallel finished in {elapsed.TotalMilliseconds:F0} ms, {clientCount*requestCount/elapsed.TotalSeconds:F1} requests per second");
+        }
+
+        [Test]
+        [Explicit("Performance test")]
+        public async Task TestEchoManyFlights()
+        {
+            const int clientCount = 10;
+            const int requestCount = 1000;
+            var elapsed = await Measure(() => RunWithServer(WithParallelClients(clientCount, PingPongTest(requestCount, WithPerformanceTestDatagram))));
+            Console.WriteLine($"Running {clientCount} in parallel with {requestCount} requests finished in {elapsed.TotalMilliseconds:F0} ms, {clientCount*requestCount/elapsed.TotalSeconds} requests per second");
+        }
+        
+        [Test]
+        [Explicit("Performance test")]
+        public async Task TestRunManySequential()
+        {
+            const int clientCount = 200;
+            const int batchSize = 50;
+            const int requestCount = 3;
+            var elapsed = await Measure(() => RunWithServer(WithManySequentialClients(clientCount, batchSize, PingPongTest(requestCount, WithPerformanceTestDatagram))));
+            Console.WriteLine($"Running {clientCount} with {requestCount} request maximum {batchSize} in parallel finished in {elapsed.TotalMilliseconds:F0} ms, effective as {clientCount/elapsed.TotalSeconds:F1} requests per second with {requestCount} flights");
+        }
+
+        private static async Task<TimeSpan> Measure(Func<Task> task)
+        {
+            var sw = Stopwatch.StartNew();
+            await task();
+            sw.Stop();
+            return sw.Elapsed;
+        }
+
+        private static ServerTest WithParallelClients(int clientCount, ClientWithEchoServerTest test)
+        {
+            return async delegate(IPEndPoint serverEndPoint)
+            {
+                var clientsTasks = new List<Task>();
+
+                for (var i = 0; i < clientCount; i++)
+                {
+                    clientsTasks.Add(RunTestWithNewClient(test, serverEndPoint));
+                }
+
+                await Task.WhenAll(clientsTasks);
+            };
+        }
+
+        private static ServerTest WithManySequentialClients(int clientCount, int batchSize, ClientWithEchoServerTest test)
+        {
+            return async delegate(IPEndPoint serverEndPoint)
+            {
+                var clientsTasks = new List<Task>();
+                
+                var i = 0;
+                for (; i < clientCount && i < batchSize; i++)
+                {
+                    clientsTasks.Add(RunTestWithNewClient(test, serverEndPoint));
+                }
+
+                while (clientsTasks.Count > 0)
+                {
+                    var task = await Task.WhenAny(clientsTasks);
+                    Assert.That(task.IsCompleted);
+                    clientsTasks.Remove(task);
+
+                    if (i < clientCount)
+                    {
+                        clientsTasks.Add(RunTestWithNewClient(test, serverEndPoint));
+                        i++;
+                    }
+                }
+            };
+        }
+
+        private static async Task RunTestWithNewClient(ClientWithEchoServerTest test, IPEndPoint serverEndPoint1)
+        {
+            using (var client = new UdpSocket(AnyPort, serverEndPoint1))
+            {
+                client.Connect();
+                await test(client, serverEndPoint1);
+            }
+        }
+
+        private static async Task RunWithServer(ServerTest test)
+        {
+            using (var server = new UdpSocket(new IPEndPoint(IPAddress.Any, 65314), AnyPort))
             {
                 server.DatagramReceived += (sender, paket) =>
                     ((UdpSocket) sender).Send(paket);
 
-                var serverEndPoint = new IPEndPoint(IPAddress.Loopback, server.Connect().Port);
+                server.Connect();
 
-                var clients = new List<IUdpSocket>();
-
-                try
-                {
-                    for (var i = 0; i < clientCount; i++)
-                    {
-                        var client = new global::UdpSockets.UdpSocket(anyPort, serverEndPoint);
-                        clients.Add(client);
-                        client.Connect();
-                    }
-
-                    test(clients, serverEndPoint);
-                }
-                finally
-                {
-                    clients.ForEach(c => c.Dispose());
-                }
+                var serverEndPoint = new IPEndPoint(IPAddress.Loopback, server.LocalEndPoint.Port);
+                await test(serverEndPoint);
             }
         }
 
-        private static EchoTest EchoRequests(int count)
-        {
-            return delegate(IEnumerable<IUdpSocket> clients, IPEndPoint serverEndPoint)
-            {
-                var clientTasks = clients.Select(client => RunTest(client, serverEndPoint, count)).ToList();
-                return Task.WhenAll(clientTasks);
-            };
-        }
+        private ClientWithEchoServerTest EchoRequests(int requestCount, CreateDatagram createDatagram) => 
+            (client, serverEndPoint) => RunEchoTest(client, serverEndPoint, requestCount, createDatagram);
 
-        private static async Task RunTest(IUdpSocket client, IPEndPoint serverEndPoint, int count)
+        private async Task RunEchoTest(IUdpSocket client, IPEndPoint serverEndPoint, int requestCount, CreateDatagram createDatagram)
         {
             var incomingPakets = new List<UdpDatagram>();
 
@@ -65,7 +152,7 @@ namespace Test.UdpSockets
             {
                 incomingPakets.Add(paket);
 
-                if (incomingPakets.Count == count)
+                if (incomingPakets.Count == requestCount)
                     receiver.TrySetResult(null);
             };
 
@@ -75,9 +162,9 @@ namespace Test.UdpSockets
             {
                 var outgoingUdpPakets = new List<UdpDatagram>();
 
-                for (var i = 0; i < count; i++)
+                for (var i = 0; i < requestCount; i++)
                 {
-                    var udpPaket = CreateUdpPaket(serverEndPoint);
+                    var udpPaket = createDatagram(serverEndPoint);
                     client.Send(udpPaket);
                     outgoingUdpPakets.Add(udpPaket);
                 }
@@ -98,25 +185,54 @@ namespace Test.UdpSockets
             }
         }
 
-        private static UdpDatagram CreateUdpPaket(IPEndPoint serverEndPoint)
+        private ClientWithEchoServerTest PingPongTest(int requestCount, CreateDatagram createDatagram) => 
+            (client, serverEndPoint) => RunPingPongTest(client, serverEndPoint, requestCount, createDatagram);
+        
+        private async Task RunPingPongTest(IUdpSocket client, IPEndPoint serverEndPoint, int requestCount, CreateDatagram createDatagram)
         {
-            var data = new byte[8];
+            var bufferBlock = new BufferBlock<UdpDatagram>();
+
+            EventHandler<UdpDatagram> clientOnPaketReceived = (sender, datagram) => bufferBlock.Post(datagram);
+
+            client.DatagramReceived += clientOnPaketReceived;
+
+            try
+            {
+                for (var i = 0; i < requestCount; i++)
+                {
+                    var outgoingUdpPaket = createDatagram(serverEndPoint);
+                    client.Send(outgoingUdpPaket);
+                    var incomingUdpPaket = await bufferBlock.ReceiveAsync(cancellationTokenSource.Token);
+                    Assert.That(incomingUdpPaket.RemoteEndPoint, Is.EqualTo(outgoingUdpPaket.RemoteEndPoint));
+                    Assert.That(incomingUdpPaket.Data, Is.EquivalentTo(outgoingUdpPaket.Data));
+                }
+            }
+            finally
+            {
+                client.DatagramReceived -= clientOnPaketReceived;
+            }
+        }
+        
+
+        private static CreateDatagram WithRandomDatagram(int paketSize) =>
+            serverEndPoint => CreateRandomDatagram(serverEndPoint, paketSize);
+
+        private static UdpDatagram CreateRandomDatagram(IPEndPoint serverEndPoint, int paketSize)
+        {
+            var data = new byte[paketSize];
             Random.NextBytes(data);
 
             var outgoingUdpPaket = new UdpDatagram(serverEndPoint, data);
             return outgoingUdpPaket;
         }
+        
 
-        [Test]
-        public void TestEcho()
+        private static UdpDatagram WithPerformanceTestDatagram(IPEndPoint serverEndPoint)
         {
-            RunTest(EchoRequests(1), 1);
-        }
-
-        [Test]
-        public void TestEchoMany()
-        {
-            RunTest(EchoRequests(10), 20);
+            var data = new byte[100];
+            Random.NextBytes(data);
+            var outgoingUdpPaket = new UdpDatagram(serverEndPoint, PerformanceTestDatagramData);
+            return outgoingUdpPaket;
         }
     }
 }
