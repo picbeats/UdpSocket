@@ -9,6 +9,12 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Test", "Test", "{B849C30B-3
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TestUdpSocket", "TestUdpSocket\TestUdpSocket.csproj", "{21A5B6EF-91EF-41C7-A874-DA5E1F3A0F43}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = ".doc", ".doc", "{B997443A-89C0-45EF-AB32-17AD987BDB10}"
+ProjectSection(SolutionItems) = preProject
+	LICENSE = LICENSE
+	README.md = README.md
+EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
