@@ -34,16 +34,19 @@ namespace UdpSockets
 
         public IPEndPoint Connect()
         {
-            if (terminated)
-                throw new InvalidOperationException("already terminated");
+            lock (sendQueue)
+            {
+                if (terminated)
+                    throw new InvalidOperationException("already terminated");
 
-            if (socket != null)
-                throw new InvalidOperationException("already connected");
+                if (socket != null)
+                    throw new InvalidOperationException("already connected");
 
-            CreateAndBindSocket();
-            StartReceive();
-            LocalEndPoint = socket.LocalEndPoint as IPEndPoint;
-            return LocalEndPoint;
+                CreateAndBindSocket();
+                StartReceive();
+                LocalEndPoint = socket.LocalEndPoint as IPEndPoint;
+                return LocalEndPoint;
+            }
         }
 
         public void Send(UdpDatagram datagram)
@@ -174,8 +177,7 @@ namespace UdpSockets
 
                 lock (sendQueue)
                 {
-                    repeat = !terminated &&
-                             !(socket?.ReceiveFromAsync(e) ?? true);
+                    repeat = !terminated && !socket.ReceiveFromAsync(e);
                 }
                 
             } while (repeat);
